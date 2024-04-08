@@ -122,15 +122,15 @@ static void show_stats(e2fsck_t	ctx)
 		       ext2fs_free_blocks_count(fs->super));
 
 	if (inodes_used > 0) {
-		frag_percent_file = (10000 * ctx->fs_fragmented) / inodes_used;
+		frag_percent_file = (int) ((10000.0 * ctx->fs_fragmented) / inodes_used);
 		frag_percent_file = (frag_percent_file + 5) / 10;
 
-		frag_percent_dir = (10000 * ctx->fs_fragmented_dir) / inodes_used;
+		frag_percent_dir = (int) ((10000.0 * ctx->fs_fragmented_dir) / inodes_used);
 		frag_percent_dir = (frag_percent_dir + 5) / 10;
 
-		frag_percent_total = ((10000 * (ctx->fs_fragmented +
-						ctx->fs_fragmented_dir))
-				      / inodes_used);
+		frag_percent_total = (int) ((10000.0 * (ctx->fs_fragmented +
+							ctx->fs_fragmented_dir))
+					    / inodes_used);
 		frag_percent_total = (frag_percent_total + 5) / 10;
 	}
 
