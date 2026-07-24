@@ -18,7 +18,6 @@
 #if !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
 #define _XOPEN_SOURCE 600
 #define _DARWIN_C_SOURCE
-#define _FILE_OFFSET_BITS 64
 #ifndef _LARGEFILE_SOURCE
 #define _LARGEFILE_SOURCE
 #endif
@@ -53,11 +52,6 @@
 #ifdef HAVE_SYS_MOUNT_H
 #include <sys/mount.h>
 #endif
-#ifdef HAVE_SYS_PRCTL_H
-#include <sys/prctl.h>
-#else
-#define PR_GET_DUMPABLE 3
-#endif
 #if HAVE_SYS_STAT_H
 #include <sys/stat.h>
 #endif
@@ -70,6 +64,9 @@
 #ifdef HAVE_PTHREAD
 #include <pthread.h>
 #endif
+#ifdef HAVE_SYS_FILE_H
+#include <sys/file.h>
+#endif
 
 #if defined(__linux__) && defined(_IO) && !defined(BLKROGET)
 #define BLKROGET   _IO(0x12, 94) /* Get read-only status (0 = read_write).  */
@@ -80,6 +77,40 @@
 #include "ext2_fs.h"
 #include "ext2fs.h"
 #include "ext2fsP.h"
+
+static inline int find_last_bit_set(int x)
+{
+	int r = 32;
+
+	if (!x)
+		return 0;
+	if (!(x & 0xffff0000u)) {
+		x = (x & 0xffffu) << 16;
+		r -= 16;
+	}
+	if (!(x & 0xff000000u)) {
+		x = (x & 0xffffffu) << 8;
+		r -= 8;
+	}
+	if (!(x & 0xf0000000u)) {
+		x = (x & 0xfffffffu) << 4;
+		r -= 4;
+	}
+	if (!(x & 0xc0000000u)) {
+		x = (x & 0x3fffffffu) << 2;
+		r -= 2;
+	}
+	if (!(x & 0x80000000u)) {
+		r -= 1;
+	}
+	return r;
+}
+
+/* Get high bit set out of 32-bit argument, -1 if none set */
+static inline int highbit32(uint32_t v)
+{
+	return find_last_bit_set(v) - 1;
+}
 
 /*
  * For checking structure magic numbers...
@@ -97,7 +128,7 @@ struct unix_cache {
 	unsigned		write_err:1;
 };
 
-#define CACHE_SIZE 8
+#define DEFAULT_CACHE_SIZE 8
 #define WRITE_DIRECT_SIZE 4	/* Must be smaller than CACHE_SIZE */
 #define READ_DIRECT_SIZE 4	/* Should be smaller than CACHE_SIZE */
 
@@ -107,8 +138,11 @@ struct unix_private_data {
 	int	flags;
 	int	align;
 	int	access_time;
+	int	unix_flock_flags;
 	ext2_loff_t offset;
-	struct unix_cache cache[CACHE_SIZE];
+	struct unix_cache *cache;
+	unsigned int cache_size;
+	unsigned int cache_hash_shift;
 	void	*bounce;
 	struct struct_io_stats io_stats;
 #ifdef HAVE_PTHREAD
@@ -180,29 +214,6 @@ static errcode_t unix_get_stats(io_channel channel, io_stats *stats)
 	}
 
 	return retval;
-}
-
-static char *safe_getenv(const char *arg)
-{
-	if ((getuid() != geteuid()) || (getgid() != getegid()))
-		return NULL;
-#ifdef HAVE_PRCTL
-	if (prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0)
-		return NULL;
-#else
-#if (defined(linux) && defined(SYS_prctl))
-	if (syscall(SYS_prctl, PR_GET_DUMPABLE, 0, 0, 0, 0) == 0)
-		return NULL;
-#endif
-#endif
-
-#if defined(HAVE_SECURE_GETENV)
-	return secure_getenv(arg);
-#elif defined(HAVE___SECURE_GETENV)
-	return __secure_getenv(arg);
-#else
-	return getenv(arg);
-#endif
 }
 
 /*
@@ -337,7 +348,8 @@ error_unlock:
 	return retval;
 }
 
-#define RAW_WRITE_NO_HANDLER	1
+#define RAW_WRITE_NO_HANDLER	(1U << 0)
+#define RAW_WRITE_NOLOCK	(1U << 1)
 
 static errcode_t raw_write_blk(io_channel channel,
 			       struct unix_private_data *data,
@@ -397,13 +409,15 @@ static errcode_t raw_write_blk(io_channel channel,
 	    (IS_ALIGNED(buf, channel->align) &&
 	     IS_ALIGNED(location, channel->align) &&
 	     IS_ALIGNED(size, channel->align))) {
-		mutex_lock(data, BOUNCE_MTX);
+		if (!(flags & RAW_WRITE_NOLOCK))
+			mutex_lock(data, BOUNCE_MTX);
 		if (ext2fs_llseek(data->dev, location, SEEK_SET) < 0) {
 			retval = errno ? errno : EXT2_ET_LLSEEK_FAILED;
 			goto error_unlock;
 		}
 		actual = write(data->dev, buf, size);
-		mutex_unlock(data, BOUNCE_MTX);
+		if (!(flags & RAW_WRITE_NOLOCK))
+			mutex_unlock(data, BOUNCE_MTX);
 		if (actual < 0) {
 			retval = errno;
 			goto error_out;
@@ -438,7 +452,8 @@ bounce_write:
 	while (size > 0) {
 		int actual_w;
 
-		mutex_lock(data, BOUNCE_MTX);
+		if (!(flags & RAW_WRITE_NOLOCK))
+			mutex_lock(data, BOUNCE_MTX);
 		if (size < align_size || offset) {
 			if (ext2fs_llseek(data->dev, aligned_blk * align_size,
 					  SEEK_SET) < 0) {
@@ -467,7 +482,8 @@ bounce_write:
 			goto error_unlock;
 		}
 		actual_w = write(data->dev, data->bounce, align_size);
-		mutex_unlock(data, BOUNCE_MTX);
+		if (!(flags & RAW_WRITE_NOLOCK))
+			mutex_unlock(data, BOUNCE_MTX);
 		if (actual_w < 0) {
 			retval = errno;
 			goto error_out;
@@ -483,7 +499,8 @@ bounce_write:
 	return 0;
 
 error_unlock:
-	mutex_unlock(data, BOUNCE_MTX);
+	if (!(flags & RAW_WRITE_NOLOCK))
+		mutex_unlock(data, BOUNCE_MTX);
 error_out:
 	if (((flags & RAW_WRITE_NO_HANDLER) == 0) && channel->write_error)
 		retval = (channel->write_error)(channel, block, count, buf,
@@ -502,10 +519,10 @@ static errcode_t alloc_cache(io_channel channel,
 {
 	errcode_t		retval;
 	struct unix_cache	*cache;
-	int			i;
+	unsigned int		i;
 
 	data->access_time = 0;
-	for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
+	for (i=0, cache = data->cache; i < data->cache_size; i++, cache++) {
 		cache->block = 0;
 		cache->access_time = 0;
 		cache->dirty = 0;
@@ -528,10 +545,10 @@ static errcode_t alloc_cache(io_channel channel,
 static void free_cache(struct unix_private_data *data)
 {
 	struct unix_cache	*cache;
-	int			i;
+	unsigned int		i;
 
 	data->access_time = 0;
-	for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
+	for (i=0, cache = data->cache; i < data->cache_size; i++, cache++) {
 		cache->block = 0;
 		cache->access_time = 0;
 		cache->dirty = 0;
@@ -544,6 +561,30 @@ static void free_cache(struct unix_private_data *data)
 }
 
 #ifndef NO_IO_CACHE
+
+/*  2^63 + 2^61 - 2^57 + 2^54 - 2^51 - 2^18 + 1 */
+#define GOLDEN_RATIO_PRIME	0x9e37fffffffc0001UL
+#ifndef CACHE_LINE_SIZE
+/* if the system didn't tell us, guess something reasonable */
+#define CACHE_LINE_SIZE		64
+#endif
+
+/* buffer cache hashing function, crudely stolen from xfsprogs */
+static unsigned int
+cache_hash(struct unix_private_data *data, blk64_t blkno)
+{
+	uint64_t	hashval = blkno;
+	uint64_t	tmp;
+
+	/* the default cache size is small, just do a linear scan */
+	if (data->cache_size <= DEFAULT_CACHE_SIZE)
+		return 0;
+
+	tmp = hashval ^ (GOLDEN_RATIO_PRIME + hashval) / CACHE_LINE_SIZE;
+	tmp = tmp ^ ((tmp ^ GOLDEN_RATIO_PRIME) >> data->cache_hash_shift);
+	return tmp % data->cache_size;
+}
+
 /*
  * Try to find a block in the cache.  If the block is not found, and
  * eldest is a non-zero pointer, then fill in eldest with the cache
@@ -554,10 +595,14 @@ static struct unix_cache *find_cached_block(struct unix_private_data *data,
 					    struct unix_cache **eldest)
 {
 	struct unix_cache	*cache, *unused_cache, *oldest_cache;
-	int			i;
+	unsigned int		hash = cache_hash(data, block);
+	unsigned int		i;
 
 	unused_cache = oldest_cache = 0;
-	for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
+	/* walk [hash..] cache elements */
+	for (i = hash, cache = data->cache + hash;
+	     i < data->cache_size;
+	     i++, cache++) {
 		if (!cache->in_use) {
 			if (!unused_cache)
 				unused_cache = cache;
@@ -565,6 +610,23 @@ static struct unix_cache *find_cached_block(struct unix_private_data *data,
 		}
 		if (cache->block == block) {
 			cache->access_time = ++data->access_time;
+			data->io_stats.cache_hits++;
+			return cache;
+		}
+		if (!oldest_cache ||
+		    (cache->access_time < oldest_cache->access_time))
+			oldest_cache = cache;
+	}
+	/* walk [..hash] since we didnt find a good slot yet */
+	for (i = 0, cache = data->cache; i < hash; i++, cache++) {
+		if (!cache->in_use) {
+			if (!unused_cache)
+				unused_cache = cache;
+			continue;
+		}
+		if (cache->block == block) {
+			cache->access_time = ++data->access_time;
+			data->io_stats.cache_hits++;
 			return cache;
 		}
 		if (!oldest_cache ||
@@ -573,6 +635,7 @@ static struct unix_cache *find_cached_block(struct unix_private_data *data,
 	}
 	if (eldest)
 		*eldest = (unused_cache) ? unused_cache : oldest_cache;
+	data->io_stats.cache_misses++;
 	return 0;
 }
 
@@ -614,26 +677,35 @@ static errcode_t flush_cached_blocks(io_channel channel,
 {
 	struct unix_cache	*cache;
 	errcode_t		retval, retval2 = 0;
-	int			i;
+	unsigned int		i;
 	int			errors_found = 0;
 
 	if ((flags & FLUSH_NOLOCK) == 0)
 		mutex_lock(data, CACHE_MTX);
-	for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
-		if (!cache->in_use || !cache->dirty)
+	for (i=0, cache = data->cache; i < data->cache_size; i++, cache++) {
+		if (!cache->in_use)
 			continue;
-		retval = raw_write_blk(channel, data,
-				       cache->block, 1, cache->buf,
-				       RAW_WRITE_NO_HANDLER);
-		if (retval) {
-			cache->write_err = 1;
-			errors_found = 1;
-			retval2 = retval;
-		} else {
-			cache->dirty = 0;
-			cache->write_err = 0;
-			if (flags & FLUSH_INVALIDATE)
-				cache->in_use = 0;
+		if (cache->dirty) {
+			int raw_flags = RAW_WRITE_NO_HANDLER;
+
+			if (flags & FLUSH_NOLOCK)
+				raw_flags |= RAW_WRITE_NOLOCK;
+
+			retval = raw_write_blk(channel, data,
+					       cache->block, 1, cache->buf,
+					       raw_flags);
+			if (retval) {
+				cache->write_err = 1;
+				errors_found = 1;
+				retval2 = retval;
+			} else {
+				cache->dirty = 0;
+				cache->write_err = 0;
+				if (flags & FLUSH_INVALIDATE)
+					cache->in_use = 0;
+			}
+		} else if (flags & FLUSH_INVALIDATE) {
+			cache->in_use = 0;
 		}
 	}
 	if ((flags & FLUSH_NOLOCK) == 0)
@@ -643,7 +715,7 @@ retry:
 		if ((flags & FLUSH_NOLOCK) == 0)
 			mutex_lock(data, CACHE_MTX);
 		errors_found = 0;
-		for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
+		for (i=0, cache = data->cache; i < data->cache_size; i++, cache++) {
 			if (!cache->in_use || !cache->write_err)
 				continue;
 			errors_found = 1;
@@ -666,6 +738,7 @@ retry:
 					retval2);
 				if (err_buf)
 					ext2fs_free_mem(&err_buf);
+				mutex_lock(data, CACHE_MTX);
 				goto retry;
 			} else
 				cache->write_err = 0;
@@ -674,6 +747,97 @@ retry:
 			mutex_unlock(data, CACHE_MTX);
 	}
 	return retval2;
+}
+
+/* Shrink the cache buffers */
+static errcode_t shrink_cache(io_channel channel,
+			      struct unix_private_data *data,
+			      unsigned int new_size)
+{
+	struct unix_cache	*cache, *new_cache;
+	unsigned int		i;
+	errcode_t		retval;
+
+	mutex_lock(data, CACHE_MTX);
+
+	retval = flush_cached_blocks(channel, data,
+			FLUSH_INVALIDATE | FLUSH_NOLOCK);
+	if (retval)
+		goto unlock;
+
+	for (i = new_size, cache = data->cache + new_size;
+	     i < data->cache_size;
+	     i++, cache++) {
+		cache->block = 0;
+		cache->access_time = 0;
+		cache->dirty = 0;
+		cache->in_use = 0;
+		if (cache->buf)
+			ext2fs_free_mem(&cache->buf);
+	}
+
+	new_cache = realloc(data->cache, new_size * sizeof(struct unix_cache));
+	if (!new_cache) {
+		retval = EXT2_ET_NO_MEMORY;
+		goto unlock;
+	}
+
+	data->cache = new_cache;
+	data->cache_size = new_size;
+	data->cache_hash_shift = highbit32(data->cache_size);
+
+unlock:
+	mutex_unlock(data, CACHE_MTX);
+	return retval;
+}
+
+/* Grow the cache buffers */
+static errcode_t grow_cache(io_channel channel,
+			    struct unix_private_data *data,
+			    unsigned int new_size)
+{
+	struct unix_cache	*cache, *new_cache;
+	unsigned int		i;
+	errcode_t		retval;
+
+	mutex_lock(data, CACHE_MTX);
+
+	retval = flush_cached_blocks(channel, data,
+			FLUSH_INVALIDATE | FLUSH_NOLOCK);
+	if (retval)
+		goto unlock;
+
+	new_cache = realloc(data->cache, new_size * sizeof(struct unix_cache));
+	if (!new_cache) {
+		retval = EXT2_ET_NO_MEMORY;
+		goto unlock;
+	}
+	data->cache = new_cache;
+
+	for (i = data->cache_size, cache = new_cache + data->cache_size;
+	     i < new_size;
+	     i++, cache++) {
+		cache->block = 0;
+		cache->access_time = 0;
+		cache->dirty = 0;
+		cache->in_use = 0;
+		retval = io_channel_alloc_buf(channel, 0, &cache->buf);
+		if (retval) {
+			while (i > data->cache_size) {
+				cache--; i--;
+				if (cache->buf)
+					ext2fs_free_mem(&cache->buf);
+			}
+			goto unlock;
+		}
+	}
+
+	data->cache_size = new_size;
+	data->cache_hash_shift = highbit32(data->cache_size);
+
+unlock:
+	mutex_unlock(data, CACHE_MTX);
+	return retval;
 }
 #endif /* NO_IO_CACHE */
 
@@ -715,6 +879,68 @@ int ext2fs_fstat(int fd, ext2fs_struct_stat *buf)
 #endif
 }
 
+#ifdef HAVE_SYS_FILE_H
+static errcode_t unix_funlock(io_channel channel)
+{
+	struct unix_private_data *data;
+	int ret;
+
+	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+	data = (struct unix_private_data *) channel->private_data;
+	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+
+	if (data->unix_flock_flags) {
+		ret = flock(data->dev, LOCK_UN);
+		if (ret)
+			return errno;
+
+		data->unix_flock_flags = 0;
+	}
+
+	return 0;
+}
+
+static errcode_t unix_flock(io_channel channel, unsigned int flock_flags)
+{
+	struct unix_private_data *data;
+	int unix_flock_flags = 0;
+	errcode_t ret;
+
+	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+	data = (struct unix_private_data *) channel->private_data;
+	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+
+	ret = unix_funlock(channel);
+	if (ret)
+		return ret;
+
+	if (flock_flags & IO_CHANNEL_FLOCK_EXCLUSIVE)
+		unix_flock_flags |= LOCK_EX;
+
+	if (flock_flags & IO_CHANNEL_FLOCK_SHARED)
+		unix_flock_flags |= LOCK_SH;
+
+	if (flock_flags & IO_CHANNEL_FLOCK_TRYLOCK)
+		unix_flock_flags |= LOCK_NB;
+
+	if (!unix_flock_flags)
+		return 0;
+
+	ret = flock(data->dev, unix_flock_flags);
+	if (ret < 0)
+		return errno;
+
+	data->unix_flock_flags = unix_flock_flags & ~LOCK_NB;
+	return 0;
+}
+#else
+#define unix_flock		NULL
+
+static errcode_t unix_funlock(io_channel channel)
+{
+	return 0;
+}
+#endif /* HAVE_SYS_FILE_H */
 
 static errcode_t unix_open_channel(const char *name, int fd,
 				   int flags, io_channel *channel,
@@ -728,7 +954,7 @@ static errcode_t unix_open_channel(const char *name, int fd,
 	struct		utsname ut;
 #endif
 
-	if (safe_getenv("UNIX_IO_FORCE_BOUNCE"))
+	if (ext2fs_safe_getenv("UNIX_IO_FORCE_BOUNCE"))
 		flags |= IO_FLAG_FORCE_BOUNCE;
 
 #ifdef __linux__
@@ -761,14 +987,22 @@ static errcode_t unix_open_channel(const char *name, int fd,
 	io->refcount = 1;
 	io->flags = 0;
 
-	if (safe_getenv("UNIX_IO_NOZEROOUT"))
+	if (ext2fs_safe_getenv("UNIX_IO_NOZEROOUT"))
 		io->flags |= CHANNEL_FLAGS_NOZEROOUT;
 
 	memset(data, 0, sizeof(struct unix_private_data));
 	data->magic = EXT2_ET_MAGIC_UNIX_IO_CHANNEL;
-	data->io_stats.num_fields = 2;
+	data->io_stats.num_fields = 4;
 	data->flags = flags;
 	data->dev = fd;
+
+	data->cache_size = DEFAULT_CACHE_SIZE;
+	data->cache_hash_shift = highbit32(data->cache_size);
+	data->cache = calloc(DEFAULT_CACHE_SIZE, sizeof(struct unix_cache));
+	if (!data->cache) {
+		retval = EXT2_ET_NO_MEMORY;
+		goto cleanup;
+	}
 
 #if defined(O_DIRECT)
 	if (flags & IO_FLAG_DIRECT_IO)
@@ -893,9 +1127,13 @@ static errcode_t unix_open_channel(const char *name, int fd,
 
 cleanup:
 	if (data) {
-		if (data->dev >= 0)
+		unix_funlock(io);
+		if (io->manager != unixfd_io_manager && data->dev >= 0)
 			close(data->dev);
-		free_cache(data);
+		if (data->cache) {
+			free_cache(data);
+			free(data->cache);
+		}
 		ext2fs_free_mem(&data);
 	}
 	if (io) {
@@ -915,15 +1153,14 @@ static errcode_t unixfd_open(const char *str_fd, int flags,
 
 	fd = atoi(str_fd);
 #if defined(HAVE_FCNTL)
-	fd_flags = fcntl(fd, F_GETFD);
+	fd_flags = fcntl(fd, F_GETFL);
 	if (fd_flags == -1)
 		return EBADF;
 
-	flags = 0;
+	/* O_EXCL is cleared by Linux at open and not returned by F_GETFL */
+	flags &= IO_FLAG_EXCLUSIVE;
 	if (fd_flags & O_RDWR)
 		flags |= IO_FLAG_RW;
-	if (fd_flags & O_EXCL)
-		flags |= IO_FLAG_EXCLUSIVE;
 #if defined(O_DIRECT)
 	if (fd_flags & O_DIRECT)
 		flags |= IO_FLAG_DIRECT_IO;
@@ -977,9 +1214,12 @@ static errcode_t unix_close(io_channel channel)
 	retval = flush_cached_blocks(channel, data, 0);
 #endif
 
-	if (close(data->dev) < 0)
+	unix_funlock(channel);
+
+	if (channel->manager != unixfd_io_manager && close(data->dev) < 0)
 		retval = errno;
 	free_cache(data);
+	free(data->cache);
 #ifdef HAVE_PTHREAD
 	if (data->flags & IO_FLAG_THREADS) {
 		pthread_mutex_destroy(&data->cache_mutex);
@@ -1335,6 +1575,25 @@ static errcode_t unix_set_option(io_channel channel, const char *option,
 		}
 		return EXT2_ET_INVALID_ARGUMENT;
 	}
+#ifndef NO_IO_CACHE
+	if (!strcmp(option, "cache_blocks")) {
+		unsigned long long	size;
+
+		if (!arg)
+			return EXT2_ET_INVALID_ARGUMENT;
+
+		errno = 0;
+		size = strtoll(arg, NULL, 0);
+		if (errno || size == 0 || size > INT32_MAX)
+			return EXT2_ET_INVALID_ARGUMENT;
+
+		if (data->cache_size == size)
+			return 0;
+		if (data->cache_size > size)
+			return shrink_cache(channel, data, size);
+		return grow_cache(channel, data, size);
+	}
+#endif
 	return EXT2_ET_INVALID_ARGUMENT;
 }
 
@@ -1493,6 +1752,7 @@ static struct struct_io_manager struct_unix_manager = {
 	.discard	= unix_discard,
 	.cache_readahead	= unix_cache_readahead,
 	.zeroout	= unix_zeroout,
+	.flock		= unix_flock,
 };
 
 io_manager unix_io_manager = &struct_unix_manager;
@@ -1514,6 +1774,7 @@ static struct struct_io_manager struct_unixfd_manager = {
 	.discard	= unix_discard,
 	.cache_readahead	= unix_cache_readahead,
 	.zeroout	= unix_zeroout,
+	.flock		= unix_flock,
 };
 
 io_manager unixfd_io_manager = &struct_unixfd_manager;

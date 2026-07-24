@@ -9,7 +9,6 @@
  * %End-Header%
  */
 
-#define _FILE_OFFSET_BITS       64
 #define _LARGEFILE64_SOURCE     1
 #define _GNU_SOURCE		1
 
@@ -31,16 +30,32 @@
 #ifdef HAVE_SYS_SYSMACROS_H
 #include <sys/sysmacros.h>
 #endif
+#if defined(HAVE_LINUX_FSVERITY_H) && defined(HAVE_FS_IOC_READ_VERITY_METADATA)
+#include <linux/fsverity.h>
+#include <linux/fs.h>
+#endif
 
-#include <ext2fs/ext2fs.h>
-#include <ext2fs/ext2_types.h>
-#include <ext2fs/fiemap.h>
+#include "ext2fs/ext2_fs.h"
+#include "ext2fs/ext2fs.h"
+#include "ext2fs/ext2_types.h"
+#include "ext2fs/fiemap.h"
 
 #include "create_inode.h"
 #include "support/nls-enable.h"
 
+#include "create_inode_libarchive.h"
+
 /* 64KiB is the minimum blksize to best minimize system call overhead. */
 #define COPY_FILE_BUFLEN	65536
+
+int link_append_flag = EXT2FS_LINK_EXPAND;
+
+#define COPY_FLAGS_MASK	(EXT2_SECRM_FL | EXT2_UNRM_FL | EXT2_COMPR_FL | \
+			 EXT2_SYNC_FL | EXT2_IMMUTABLE_FL | EXT2_APPEND_FL | \
+			 EXT2_NODUMP_FL | EXT2_NOATIME_FL | \
+			 EXT3_JOURNAL_DATA_FL | EXT2_NOTAIL_FL | \
+			 EXT2_DIRSYNC_FL | EXT2_TOPDIR_FL | FS_DAX_FL | \
+			 EXT4_PROJINHERIT_FL | EXT4_CASEFOLD_FL)
 
 static int ext2_file_type(unsigned int mode)
 {
@@ -69,7 +84,7 @@ static int ext2_file_type(unsigned int mode)
 }
 
 /* Link an inode number to a directory */
-static errcode_t add_link(ext2_filsys fs, ext2_ino_t parent_ino,
+errcode_t add_link(ext2_filsys fs, ext2_ino_t parent_ino,
 			  ext2_ino_t ino, const char *name)
 {
 	struct ext2_inode	inode;
@@ -82,17 +97,7 @@ static errcode_t add_link(ext2_filsys fs, ext2_ino_t parent_ino,
 	}
 
 	retval = ext2fs_link(fs, parent_ino, name, ino,
-			     ext2_file_type(inode.i_mode));
-	if (retval == EXT2_ET_DIR_NO_SPACE) {
-		retval = ext2fs_expand_dir(fs, parent_ino);
-		if (retval) {
-			com_err(__func__, retval,
-				_("while expanding directory"));
-			return retval;
-		}
-		retval = ext2fs_link(fs, parent_ino, name, ino,
-				     ext2_file_type(inode.i_mode));
-	}
+			     ext2_file_type(inode.i_mode) | link_append_flag);
 	if (retval) {
 		com_err(__func__, retval, _("while linking \"%s\""), name);
 		return retval;
@@ -107,9 +112,16 @@ static errcode_t add_link(ext2_filsys fs, ext2_ino_t parent_ino,
 	return retval;
 }
 
+static time_t clamped_time(ext2_filsys fs, time_t t)
+{
+	if ((fs->flags2 & EXT2_FLAG2_USE_FAKE_TIME) && t > fs->now)
+		return fs->now;
+	return t;
+}
+
 /* Set the uid, gid, mode and time for the inode */
-static errcode_t set_inode_extra(ext2_filsys fs, ext2_ino_t ino,
-				 struct stat *st)
+errcode_t set_inode_extra(ext2_filsys fs, ext2_ino_t ino,
+				 const struct stat *st)
 {
 	errcode_t		retval;
 	struct ext2_inode	inode;
@@ -125,9 +137,9 @@ static errcode_t set_inode_extra(ext2_filsys fs, ext2_ino_t ino,
 	inode.i_gid = st->st_gid;
 	ext2fs_set_i_gid_high(inode, st->st_gid >> 16);
 	inode.i_mode = (LINUX_S_IFMT & inode.i_mode) | (~S_IFMT & st->st_mode);
-	inode.i_atime = st->st_atime;
-	inode.i_mtime = st->st_mtime;
-	inode.i_ctime = st->st_ctime;
+	ext2fs_inode_xtime_set(&inode, i_atime, clamped_time(fs, st->st_atime));
+	ext2fs_inode_xtime_set(&inode, i_ctime, clamped_time(fs, st->st_ctime));
+	ext2fs_inode_xtime_set(&inode, i_mtime, clamped_time(fs, st->st_mtime));
 
 	retval = ext2fs_write_inode(fs, ino, &inode);
 	if (retval)
@@ -144,9 +156,6 @@ static errcode_t set_inode_xattr(ext2_filsys fs, ext2_ino_t ino,
 	ssize_t				size, value_size;
 	char				*list = NULL;
 	int				i;
-
-	if (no_copy_xattrs)
-		return 0;
 
 	size = llistxattr(filename, NULL, 0);
 	if (size == -1) {
@@ -256,6 +265,7 @@ errcode_t do_mknod_internal(ext2_filsys fs, ext2_ino_t cwd, const char *name,
 	struct ext2_inode	inode;
 	unsigned long		devmajor, devminor, mode;
 	int			filetype;
+	time_t			now;
 
 	switch(st_mode & S_IFMT) {
 	case S_IFCHR:
@@ -290,16 +300,7 @@ errcode_t do_mknod_internal(ext2_filsys fs, ext2_ino_t cwd, const char *name,
 #ifdef DEBUGFS
 	printf("Allocated inode: %u\n", ino);
 #endif
-	retval = ext2fs_link(fs, cwd, name, ino, filetype);
-	if (retval == EXT2_ET_DIR_NO_SPACE) {
-		retval = ext2fs_expand_dir(fs, cwd);
-		if (retval) {
-			com_err(__func__, retval,
-				_("while expanding directory"));
-			return retval;
-		}
-		retval = ext2fs_link(fs, cwd, name, ino, filetype);
-	}
+	retval = ext2fs_link(fs, cwd, name, ino, filetype | link_append_flag);
 	if (retval) {
 		com_err(name, retval, _("while creating inode \"%s\""), name);
 		return retval;
@@ -309,8 +310,10 @@ errcode_t do_mknod_internal(ext2_filsys fs, ext2_ino_t cwd, const char *name,
 	ext2fs_inode_alloc_stats2(fs, ino, +1, 0);
 	memset(&inode, 0, sizeof(inode));
 	inode.i_mode = mode;
-	inode.i_atime = inode.i_ctime = inode.i_mtime =
-		fs->now ? fs->now : time(0);
+	now = fs->now ? fs->now : time(0);
+	ext2fs_inode_xtime_set(&inode, i_atime, now);
+	ext2fs_inode_xtime_set(&inode, i_ctime, now);
+	ext2fs_inode_xtime_set(&inode, i_mtime, now);
 
 	if (filetype != S_IFIFO) {
 		devmajor = major(st_rdev);
@@ -373,7 +376,7 @@ errcode_t do_symlink_internal(ext2_filsys fs, ext2_ino_t cwd, const char *name,
 
 /* Make a directory in the fs */
 errcode_t do_mkdir_internal(ext2_filsys fs, ext2_ino_t cwd, const char *name,
-			    ext2_ino_t root)
+			    unsigned long flags, ext2_ino_t root)
 {
 	char			*cp;
 	ext2_ino_t		parent_ino;
@@ -393,18 +396,10 @@ errcode_t do_mkdir_internal(ext2_filsys fs, ext2_ino_t cwd, const char *name,
 	} else
 		parent_ino = cwd;
 
-	retval = ext2fs_mkdir(fs, parent_ino, 0, name);
-	if (retval == EXT2_ET_DIR_NO_SPACE) {
-		retval = ext2fs_expand_dir(fs, parent_ino);
-		if (retval) {
-			com_err(__func__, retval,
-				_("while expanding directory"));
-			return retval;
-		}
-		retval = ext2fs_mkdir(fs, parent_ino, 0, name);
-	}
+	retval = ext2fs_mkdir2(fs, parent_ino, 0, (flags & COPY_FLAGS_MASK),
+			       link_append_flag, name, NULL);
 	if (retval)
-		com_err("ext2fs_mkdir", retval,
+		com_err("ext2fs_mkdir2", retval,
 			_("while creating directory \"%s\""), name);
 	return retval;
 }
@@ -419,13 +414,32 @@ static ssize_t my_pread(int fd, void *buf, size_t count, off_t offset)
 }
 #endif /* !defined HAVE_PREAD64 && !defined HAVE_PREAD */
 
+static errcode_t write_all(ext2_file_t e2_file, __u64 off, const char *buf, unsigned int n_bytes) {
+	errcode_t err = ext2fs_file_llseek(e2_file, off, EXT2_SEEK_SET, NULL);
+	if (err)
+		return err;
+
+	const char *ptr = buf;
+	while (n_bytes) {
+		unsigned int written;
+		err = ext2fs_file_write(e2_file, ptr, n_bytes, &written);
+		if (err)
+			return err;
+		if (written == 0)
+			return EIO;
+		n_bytes -= written;
+		ptr += written;
+	}
+
+	return 0;
+}
+
 static errcode_t copy_file_chunk(ext2_filsys fs, int fd, ext2_file_t e2_file,
 				 off_t start, off_t end, char *buf,
 				 char *zerobuf)
 {
 	off_t off, bpos;
 	ssize_t got, blen;
-	unsigned int written;
 	char *ptr;
 	errcode_t err = 0;
 
@@ -449,22 +463,10 @@ static errcode_t copy_file_chunk(ext2_filsys fs, int fd, ext2_file_t e2_file,
 				ptr += blen;
 				continue;
 			}
-			err = ext2fs_file_llseek(e2_file, off + bpos,
-						 EXT2_SEEK_SET, NULL);
+			err = write_all(e2_file, off + bpos, ptr, blen);
 			if (err)
 				goto fail;
-			while (blen > 0) {
-				err = ext2fs_file_write(e2_file, ptr, blen,
-							&written);
-				if (err)
-					goto fail;
-				if (written == 0) {
-					err = EIO;
-					goto fail;
-				}
-				blen -= written;
-				ptr += written;
-			}
+			ptr += blen;
 		}
 	}
 fail:
@@ -567,8 +569,144 @@ out:
 }
 #endif /* FS_IOC_FIEMAP */
 
+#if defined(HAVE_LINUX_FSVERITY_H) && defined(HAVE_FS_IOC_READ_VERITY_METADATA)
+static inline off_t round_up(off_t n, off_t blksz, off_t bias)
+{
+  return ((n - bias + (blksz - 1)) & ~(blksz - 1)) + bias;
+}
+
+static errcode_t copy_fs_verity_data(ext2_file_t e2_file, ext2_off_t e2_offset,
+				     int fd, uint64_t metadata_type,
+				     __u32 *written)
+{
+	errcode_t err;
+	char buf[COPY_FILE_BUFLEN];
+	int size;
+
+	*written = 0;
+
+	do {
+		struct fsverity_read_metadata_arg arg = {
+		  .metadata_type = metadata_type,
+#if (SIZEOF_VOID_P == 4)
+		  .buf_ptr = (uint32_t) buf,
+#else
+		  .buf_ptr = (uint64_t) buf,
+#endif
+		  .length = sizeof(buf),
+		  .offset = *written,
+		};
+
+		size = ioctl(fd, FS_IOC_READ_VERITY_METADATA, &arg);
+		if (size < 0) {
+			if (errno == EINTR)
+				continue;
+			return errno;
+		}
+		/*
+		 * In order to support copying in signature blob, we
+		 * need to set the descriptor's sig_size field (which
+		 * is the __reserved_0x04 field in the userspace
+		 * version of the structure if there is a signature
+		 * blob.  To deal with this, we rely on the fact that
+		 * size of the fsverity descriptor (256 bytes) is
+		 * significantly smaller than COPY_FILE_BUFLEN (64k
+		 * bytes), and that combined size descriptor and
+		 * signature blob will fit in COPY_FILE_BUFLEN.
+		 */
+		if (metadata_type == FS_VERITY_METADATA_TYPE_DESCRIPTOR) {
+			int	sig_size;
+			struct fsverity_descriptor *desc = (void *) buf;
+
+			arg.metadata_type = FS_VERITY_METADATA_TYPE_SIGNATURE;
+			arg.buf_ptr += size;
+			arg.length -= size;
+			arg.offset = 0;
+			sig_size = ioctl(fd, FS_IOC_READ_VERITY_METADATA, &arg);
+			if (sig_size > 0) {
+				desc->__reserved_0x04 =
+					ext2fs_cpu_to_le32(sig_size);
+				size += sig_size;
+			}
+			err = write_all(e2_file, e2_offset, buf, size);
+			if (err == 0)
+				*written += size;
+			return err;
+		}
+		err = write_all(e2_file, e2_offset, buf, size);
+		if (err)
+			return err;
+
+		e2_offset += size;
+		*written += size;
+	} while (size != 0);
+
+	return 0;
+}
+
+static errcode_t copy_fs_verity(ext2_filsys fs, int fd,
+				ext2_file_t e2_file, off_t st_size)
+{
+	ext2_ino_t ino = ext2fs_file_get_inode_num(e2_file);
+	struct ext2_inode *inode = ext2fs_file_get_inode(e2_file);
+	off_t offset = round_up(st_size, 65536, 0);
+	__u32 written;
+	errcode_t err;
+
+	if (!ino || !inode ||
+	    !(inode->i_flags & EXT4_EXTENTS_FL) ||
+	    (inode->i_flags & EXT4_INLINE_DATA_FL))
+		return 0;
+
+	/* We read the existing fs-verity data out of the host
+	 * filesystem and write it verbatim into the file we're
+	 * creating, as blocks following the end of the file.
+	 *
+	 * https://docs.kernel.org/filesystems/fsverity.html#fs-ioc-read-verity-metadata
+	 * https://docs.kernel.org/filesystems/ext4/overview.html#verity-files
+	 */
+
+	/*  Copy Merkel tree data: might be empty (for empty files) */
+	err = copy_fs_verity_data(e2_file, offset, fd,
+				  FS_VERITY_METADATA_TYPE_MERKLE_TREE,
+				  &written);
+	/* These errors are if the file/filesystem/kernel doesn't have
+	 * fs-verity.  If those happened before we wrote anything,
+	 * then we already did the right thing.
+	 */
+	if ((err == ENODATA || err == ENOTTY || err == ENOTSUP) && !written)
+		return 0;
+	if (err)
+		return err;
+	offset = round_up(offset+written, fs->blocksize, 0);
+
+	/*
+	 * Write the verity descriptor, starting at the next file
+	 * system block boundary
+	 */
+	err = copy_fs_verity_data(e2_file, offset, fd,
+				  FS_VERITY_METADATA_TYPE_DESCRIPTOR,
+				  &written);
+	offset = round_up(offset+written, fs->blocksize, -4);
+
+	/*
+	 * Write the size of the verity descriptor in bytes, as a
+	 * 4-byte little endian integer.
+	 */
+	written = ext2fs_cpu_to_le32(written);
+	err = write_all(e2_file, offset, (const char *) &written, 4);
+	if (err)
+		return err;
+
+	/* Reset size in the inode to the original file size */;
+	ext2fs_inode_size_set(fs, inode, st_size);
+	inode->i_flags |= EXT4_VERITY_FL;
+	return ext2fs_write_inode(fs, ino, inode);
+}
+#endif
+
 static errcode_t copy_file(ext2_filsys fs, int fd, struct stat *statbuf,
-			   ext2_ino_t ino)
+			   unsigned long flags, ext2_ino_t ino)
 {
 	ext2_file_t e2_file;
 	char *buf = NULL, *zerobuf = NULL;
@@ -586,20 +724,25 @@ static errcode_t copy_file(ext2_filsys fs, int fd, struct stat *statbuf,
 	if (err)
 		goto out;
 
+	err = EXT2_ET_UNIMPLEMENTED;
 #if defined(SEEK_DATA) && defined(SEEK_HOLE)
 	err = try_lseek_copy(fs, fd, statbuf, e2_file, buf, zerobuf);
-	if (err != EXT2_ET_UNIMPLEMENTED)
-		goto out;
 #endif
 
 #if defined(FS_IOC_FIEMAP)
-	err = try_fiemap_copy(fs, fd, e2_file, buf, zerobuf);
-	if (err != EXT2_ET_UNIMPLEMENTED)
-		goto out;
+	if (err == EXT2_ET_UNIMPLEMENTED)
+		err = try_fiemap_copy(fs, fd, e2_file, buf, zerobuf);
 #endif
 
-	err = copy_file_chunk(fs, fd, e2_file, 0, statbuf->st_size, buf,
-			      zerobuf);
+	if (err == EXT2_ET_UNIMPLEMENTED)
+		err = copy_file_chunk(fs, fd, e2_file, 0, statbuf->st_size, buf,
+				      zerobuf);
+
+#if defined(HAVE_LINUX_FSVERITY_H) && defined(HAVE_FS_IOC_READ_VERITY_METADATA)
+	if (!err && (flags & EXT4_VERITY_FL))
+		err = copy_fs_verity(fs, fd, e2_file, statbuf->st_size);
+#endif
+
 out:
 	ext2fs_free_mem(&zerobuf);
 	ext2fs_free_mem(&buf);
@@ -623,7 +766,8 @@ static int is_hardlink(struct hdlinks_s *hdlinks, dev_t dev, ino_t ino)
 
 /* Copy the native file to the fs */
 errcode_t do_write_internal(ext2_filsys fs, ext2_ino_t cwd, const char *src,
-			    const char *dest, ext2_ino_t root)
+			    const char *dest, unsigned long flags,
+			    ext2_ino_t root)
 {
 	int		fd;
 	struct stat	statbuf;
@@ -631,6 +775,7 @@ errcode_t do_write_internal(ext2_filsys fs, ext2_ino_t cwd, const char *src,
 	errcode_t	retval;
 	struct ext2_inode inode;
 	char		*cp;
+	time_t		now;
 
 	fd = ext2fs_open_file(src, O_RDONLY, 0);
 	if (fd < 0) {
@@ -669,14 +814,8 @@ errcode_t do_write_internal(ext2_filsys fs, ext2_ino_t cwd, const char *src,
 #ifdef DEBUGFS
 	printf("Allocated inode: %u\n", newfile);
 #endif
-	retval = ext2fs_link(fs, parent_ino, dest, newfile, EXT2_FT_REG_FILE);
-	if (retval == EXT2_ET_DIR_NO_SPACE) {
-		retval = ext2fs_expand_dir(fs, parent_ino);
-		if (retval)
-			goto out;
-		retval = ext2fs_link(fs, parent_ino, dest, newfile,
-					EXT2_FT_REG_FILE);
-	}
+	retval = ext2fs_link(fs, parent_ino, dest, newfile,
+			     EXT2_FT_REG_FILE | link_append_flag);
 	if (retval)
 		goto out;
 	if (ext2fs_test_inode_bitmap2(fs->inode_map, newfile))
@@ -684,8 +823,10 @@ errcode_t do_write_internal(ext2_filsys fs, ext2_ino_t cwd, const char *src,
 	ext2fs_inode_alloc_stats2(fs, newfile, +1, 0);
 	memset(&inode, 0, sizeof(inode));
 	inode.i_mode = (statbuf.st_mode & ~S_IFMT) | LINUX_S_IFREG;
-	inode.i_atime = inode.i_ctime = inode.i_mtime =
-		fs->now ? fs->now : time(0);
+	now = fs->now ? fs->now : time(0);
+	ext2fs_inode_xtime_set(&inode, i_atime, now);
+	ext2fs_inode_xtime_set(&inode, i_ctime, now);
+	ext2fs_inode_xtime_set(&inode, i_mtime, now);
 	inode.i_links_count = 1;
 	retval = ext2fs_inode_size_set(fs, &inode, statbuf.st_size);
 	if (retval)
@@ -701,6 +842,7 @@ errcode_t do_write_internal(ext2_filsys fs, ext2_ino_t cwd, const char *src,
 			goto out;
 		ext2fs_extent_free(handle);
 	}
+	inode.i_flags |= (flags & COPY_FLAGS_MASK);
 
 	retval = ext2fs_write_new_inode(fs, newfile, &inode);
 	if (retval)
@@ -711,7 +853,7 @@ errcode_t do_write_internal(ext2_filsys fs, ext2_ino_t cwd, const char *src,
 			goto out;
 	}
 	if (LINUX_S_ISREG(inode.i_mode)) {
-		retval = copy_file(fs, fd, &statbuf, newfile);
+		retval = copy_file(fs, fd, &statbuf, flags, newfile);
 		if (retval)
 			goto out;
 	}
@@ -719,12 +861,6 @@ out:
 	close(fd);
 	return retval;
 }
-
-struct file_info {
-	char *path;
-	size_t path_len;
-	size_t path_max_len;
-};
 
 static errcode_t path_append(struct file_info *target, const char *file)
 {
@@ -804,11 +940,13 @@ static errcode_t __populate_fs(ext2_filsys fs, ext2_ino_t parent_ino,
 			       const char *source_dir, ext2_ino_t root,
 			       struct hdlinks_s *hdlinks,
 			       struct file_info *target,
+			       int flags,
 			       struct fs_ops_callbacks *fs_callbacks)
 {
 	const char	*name;
 	struct dirent	**dent;
 	struct stat	st;
+	unsigned long	fl;
 	unsigned int	save_inode;
 	ext2_ino_t	ino;
 	errcode_t	retval = 0;
@@ -843,6 +981,8 @@ static errcode_t __populate_fs(ext2_filsys fs, ext2_ino_t parent_ino,
 				name);
 			goto out;
 		}
+		if (fgetflags(name, &fl) < 0)
+			fl = 0;
 
 		/* Check for hardlinks */
 		save_inode = 0;
@@ -936,7 +1076,7 @@ static errcode_t __populate_fs(ext2_filsys fs, ext2_ino_t parent_ino,
 #endif /* !_WIN32 */
 		case S_IFREG:
 			retval = do_write_internal(fs, parent_ino, name, name,
-						   root);
+						   fl, root);
 			if (retval) {
 				com_err(__func__, retval,
 					_("while writing file \"%s\""), name);
@@ -949,7 +1089,7 @@ static errcode_t __populate_fs(ext2_filsys fs, ext2_ino_t parent_ino,
 			    strcmp(name, "lost+found") == 0)
 				goto find_lnf;
 			retval = do_mkdir_internal(fs, parent_ino, name,
-						   root);
+						   fl, root);
 			if (retval) {
 				com_err(__func__, retval,
 					_("while making dir \"%s\""), name);
@@ -964,7 +1104,7 @@ find_lnf:
 			}
 			/* Populate the dir recursively*/
 			retval = __populate_fs(fs, ino, name, root, hdlinks,
-					       target, fs_callbacks);
+					       target, flags, fs_callbacks);
 			if (retval)
 				goto out;
 			if (chdir("..")) {
@@ -993,11 +1133,14 @@ find_lnf:
 			goto out;
 		}
 
-		retval = set_inode_xattr(fs, ino, name);
-		if (retval) {
-			com_err(__func__, retval,
-				_("while setting xattrs for \"%s\""), name);
-			goto out;
+		if ((flags & POPULATE_FS_NO_COPY_XATTRS) == 0) {
+			retval = set_inode_xattr(fs, ino, name);
+			if (retval) {
+				com_err(__func__, retval,
+					_("while setting xattrs for \"%s\""),
+					name);
+				goto out;
+			}
 		}
 
 		if (fs_callbacks && fs_callbacks->end_create_new_inode) {
@@ -1043,8 +1186,8 @@ out:
 	return retval;
 }
 
-errcode_t populate_fs2(ext2_filsys fs, ext2_ino_t parent_ino,
-		       const char *source_dir, ext2_ino_t root,
+errcode_t populate_fs3(ext2_filsys fs, ext2_ino_t parent_ino,
+		       const char *source, ext2_ino_t root, int flags,
 		       struct fs_ops_callbacks *fs_callbacks)
 {
 	struct file_info file_info;
@@ -1069,24 +1212,61 @@ errcode_t populate_fs2(ext2_filsys fs, ext2_ino_t parent_ino,
 	file_info.path_max_len = 255;
 	file_info.path = calloc(file_info.path_max_len, 1);
 
-	retval = set_inode_xattr(fs, root, source_dir);
-	if (retval) {
-		com_err(__func__, retval,
-			_("while copying xattrs on root directory"));
+	link_append_flag = EXT2FS_LINK_EXPAND;
+	link_append_flag |= (flags & POPULATE_FS_LINK_APPEND) ?
+		EXT2FS_LINK_APPEND : 0;
+
+	/* interpret input as tarball either if it's "-" (stdin) or if it's
+	 * a regular file (or a symlink pointing to a regular file)
+	 */
+	if (strcmp(source, "-") == 0) {
+		retval = __populate_fs_from_tar(fs, parent_ino, NULL, root,
+						&hdlinks, &file_info, flags,
+						fs_callbacks);
 		goto out;
 	}
 
-	retval = __populate_fs(fs, parent_ino, source_dir, root, &hdlinks,
-			       &file_info, fs_callbacks);
+	struct stat st;
+	if (stat(source, &st)) {
+		retval = errno;
+		com_err(__func__, retval, _("while calling stat"));
+		goto out;
+	}
+	if (S_ISREG(st.st_mode)) {
+		retval = __populate_fs_from_tar(fs, parent_ino, source, root,
+						&hdlinks, &file_info, flags,
+						fs_callbacks);
+		goto out;
+	}
+
+	if ((flags & POPULATE_FS_NO_COPY_XATTRS) == 0) {
+		retval = set_inode_xattr(fs, root, source);
+		if (retval) {
+			com_err(__func__, retval,
+				_("while copying xattrs on root directory"));
+			goto out;
+		}
+	}
+
+	retval = __populate_fs(fs, parent_ino, source, root, &hdlinks,
+			       &file_info, flags, fs_callbacks);
 
 out:
 	free(file_info.path);
 	free(hdlinks.hdl);
+	link_append_flag = EXT2FS_LINK_EXPAND;
 	return retval;
 }
 
-errcode_t populate_fs(ext2_filsys fs, ext2_ino_t parent_ino,
-		      const char *source_dir, ext2_ino_t root)
+errcode_t populate_fs2(ext2_filsys fs, ext2_ino_t parent_ino,
+		       const char *source, ext2_ino_t root,
+		       struct fs_ops_callbacks *fs_callbacks)
 {
-	return populate_fs2(fs, parent_ino, source_dir, root, NULL);
+	return populate_fs3(fs, parent_ino, source, root, 0, fs_callbacks);
+}
+
+errcode_t populate_fs(ext2_filsys fs, ext2_ino_t parent_ino,
+		      const char *source, ext2_ino_t root)
+{
+	return populate_fs3(fs, parent_ino, source, root, 0, NULL);
 }

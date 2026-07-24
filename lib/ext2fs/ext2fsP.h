@@ -26,6 +26,13 @@ static inline int ext2fsP_is_disk_device(mode_t mode)
 #endif
 }
 
+static inline time_t ext2fsP_get_time(ext2_filsys fs)
+{
+	if (fs->now || (fs->flags2 & EXT2_FLAG2_USE_FAKE_TIME))
+		return fs->now;
+	return time(NULL);
+}
+
 /*
  * Badblocks list
  */
@@ -206,5 +213,8 @@ extern int ext2fs_file_block_offset_too_big(ext2_filsys fs,
 typedef void (*ext2_exit_fn)(void *);
 errcode_t ext2fs_add_exit_fn(ext2_exit_fn fn, void *data);
 errcode_t ext2fs_remove_exit_fn(ext2_exit_fn fn, void *data);
+
+#define ARRAY_SIZE(array)			\
+        (sizeof(array) / sizeof(array[0]))
 
 #define EXT2FS_BUILD_BUG_ON(cond) ((void)sizeof(char[1 - 2*!!(cond)]))

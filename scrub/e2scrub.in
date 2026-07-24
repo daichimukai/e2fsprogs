@@ -159,6 +159,13 @@ if [ ! -e "${dev}" ]; then
 	exitcode 16
 fi
 
+# Do not scrub unjournalled filesystems; they are inconsistent when mounted
+if [ "${reap}" -eq 0 ] && ! dumpe2fs -h "${dev}" | grep -q 'has_journal'; then
+	echo "${arg}: Filesystem has no journal, cannot check."
+	print_help
+	exitcode 16
+fi
+
 # Make sure this is an LVM device we can snapshot
 lvm_vars="$(lvs --nameprefixes -o name,vgname,lv_role --noheadings "${dev}" 2> /dev/null)"
 eval "${lvm_vars}"
@@ -175,7 +182,7 @@ snap_dev="/dev/${LVM2_VG_NAME}/${snap}"
 teardown() {
 	# Remove and wait for removal to succeed.
 	${DBG} lvremove -f "${LVM2_VG_NAME}/${snap}"
-	while [ -e "${snap_dev}" ] && [ "$?" -eq "5" ]; do
+	while [ "$?" -eq "5" ] && [ -e "${snap_dev}" ]; do
 		sleep 0.5
 		${DBG} lvremove -f "${LVM2_VG_NAME}/${snap}"
 	done
@@ -203,7 +210,7 @@ setup() {
 	# Try to remove snapshot for 30s, bail out if we can't remove it.
 	lvremove_deadline="$(( $(date "+%s") + 30))"
 	${DBG} lvremove -f "${LVM2_VG_NAME}/${snap}" 2>/dev/null
-	while [ -e "${snap_dev}" ] && [ "$?" -eq "5" ] &&
+	while [ "$?" -eq "5" ] && [ -e "${snap_dev}" ] &&
 	      [ "$(date "+%s")" -lt "${lvremove_deadline}" ]; do
 		sleep 0.5
 		${DBG} lvremove -f "${LVM2_VG_NAME}/${snap}"

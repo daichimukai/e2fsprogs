@@ -245,6 +245,8 @@ void wait_on_buffer(struct buffer_head *bh)
 
 static void ext2fs_clear_recover(ext2_filsys fs, int error)
 {
+	time_t s_mtime;
+
 	ext2fs_clear_feature_journal_needs_recovery(fs->super);
 
 	/* if we had an error doing journal recovery, we need a full fsck */
@@ -254,8 +256,9 @@ static void ext2fs_clear_recover(ext2_filsys fs, int error)
 	 * If we replayed the journal by definition the file system
 	 * was mounted since the last time it was checked
 	 */
-	if (fs->super->s_lastcheck >= fs->super->s_mtime)
-		fs->super->s_lastcheck = fs->super->s_mtime - 1;
+	s_mtime = ext2fs_get_tstamp(fs->super, s_mtime);
+	if (ext2fs_get_tstamp(fs->super, s_lastcheck) >= s_mtime)
+		ext2fs_set_tstamp(fs->super, s_lastcheck, s_mtime - 1);
 	ext2fs_mark_super_dirty(fs);
 }
 
@@ -678,7 +681,7 @@ static void ext2fs_journal_release(ext2_filsys fs, journal_t *journal,
  * This function makes sure that the superblock fields regarding the
  * journal are consistent.
  */
-static errcode_t ext2fs_check_ext3_journal(ext2_filsys fs)
+errcode_t ext2fs_check_ext3_journal(ext2_filsys fs)
 {
 	struct ext2_super_block *sb = fs->super;
 	journal_t *journal;
@@ -735,10 +738,12 @@ err:
 	return retval;
 }
 
-static errcode_t recover_ext3_journal(ext2_filsys fs)
+#define recover_ext3_journal(fs) ext2fs_open_journal(fs, NULL)
+errcode_t ext2fs_open_journal(ext2_filsys fs, journal_t **j)
 {
 	journal_t *journal;
 	errcode_t retval;
+	long hash_size;
 
 	retval = jbd2_journal_init_revoke_record_cache();
 	if (retval)
@@ -756,19 +761,34 @@ static errcode_t recover_ext3_journal(ext2_filsys fs)
 	if (retval)
 		goto errout;
 
-	retval = jbd2_journal_init_revoke(journal, 1024);
+	/* The hash table defaults to 2 bytes per journal block (average of
+	 * 8 entries in a hash bucket in absolute worst case), but the total
+	 * memory usage depends on the number of revoke blocks.  The system
+	 * should be able to handle this much RAM usage, since it uses at
+	 * least this much memory for the journal when running.  The max limit
+	 * check is to avoid problems if the journal size is wrong somehow. */
+	hash_size = roundup_power_of_two(journal->j_superblock->s_maxlen / 16);
+	if (hash_size > JBD2_MAX_JOURNAL_BLOCKS / 16)
+		hash_size = roundup_power_of_two(JBD2_MAX_JOURNAL_BLOCKS / 16);
+	retval = jbd2_journal_init_revoke(journal, hash_size);
 	if (retval)
 		goto errout;
 
-	retval = -jbd2_journal_recover(journal);
-	if (retval)
-		goto errout;
+	if (!j) {
+		retval = -jbd2_journal_recover(journal);
+		if (retval)
+			goto errout;
+	}
 
 	if (journal->j_failed_commit) {
 		journal->j_superblock->s_errno = -EINVAL;
 		mark_buffer_dirty(journal->j_sb_buffer);
 	}
 
+	if (j) {
+		*j = journal;
+		return 0;
+	}
 	journal->j_tail_sequence = journal->j_transaction_sequence;
 
 errout:
@@ -848,47 +868,6 @@ errcode_t ext2fs_run_ext3_journal(ext2_filsys *fsp)
 outfree:
 	free(save);
 	return retval ? retval : recover_retval;
-}
-
-errcode_t ext2fs_open_journal(ext2_filsys fs, journal_t **j)
-{
-	journal_t *journal;
-	errcode_t retval;
-
-	retval = jbd2_journal_init_revoke_record_cache();
-	if (retval)
-		return retval;
-
-	retval = jbd2_journal_init_revoke_table_cache();
-	if (retval)
-		return retval;
-
-	retval = ext2fs_get_journal(fs, &journal);
-	if (retval)
-		return retval;
-
-	retval = ext2fs_journal_load(journal);
-	if (retval)
-		goto errout;
-
-	retval = jbd2_journal_init_revoke(journal, 1024);
-	if (retval)
-		goto errout;
-
-	if (journal->j_failed_commit) {
-		journal->j_superblock->s_errno = -EINVAL;
-		mark_buffer_dirty(journal->j_sb_buffer);
-	}
-
-	*j = journal;
-	return 0;
-
-errout:
-	jbd2_journal_destroy_revoke(journal);
-	jbd2_journal_destroy_revoke_record_cache();
-	jbd2_journal_destroy_revoke_table_cache();
-	ext2fs_journal_release(fs, journal, 1, 0);
-	return retval;
 }
 
 errcode_t ext2fs_close_journal(ext2_filsys fs, journal_t **j)

@@ -222,6 +222,11 @@ typedef struct ext2_file *ext2_file_t;
 #define EXT2_FLAG_IGNORE_SWAP_DIRENT	0x8000000
 
 /*
+ * Internal flags for use by the ext2fs library only
+ */
+#define EXT2_FLAG2_USE_FAKE_TIME	0x000000001
+
+/*
  * Special flag in the ext2 inode i_flag field that means that this is
  * a new inode.  (So that ext2_write_inode() can clear extra fields.)
  */
@@ -275,10 +280,11 @@ struct struct_ext2_filsys {
 	int				cluster_ratio_bits;
 	__u16				default_bitmap_type;
 	__u16				pad;
+	__u32				flags2;
 	/*
 	 * Reserved for future expansion
 	 */
-	__u32				reserved[5];
+	__u32				reserved[4];
 
 	/*
 	 * Reserved for the use of the calling application.
@@ -579,6 +585,76 @@ typedef struct ext2_struct_inode_scan *ext2_inode_scan;
  */
 #define EXT2_I_SIZE(i)	((i)->i_size | ((__u64) (i)->i_size_high << 32))
 
+static inline __u32 __encode_extra_time(time_t seconds EXT2FS_ATTR((unused)),
+					__u32 nsec)
+{
+	__u32 extra = 0;
+
+#if (SIZEOF_TIME_T > 4)
+	extra = ((seconds - (__s32)(seconds & 0xffffffff)) >> 32) &
+		EXT4_EPOCH_MASK;
+#endif
+	return extra | (nsec << EXT4_EPOCH_BITS);
+}
+static inline time_t __decode_extra_sec(time_t seconds,
+					__u32 extra EXT2FS_ATTR((unused)))
+{
+#if (SIZEOF_TIME_T > 4)
+	if (extra & EXT4_EPOCH_MASK)
+		seconds += ((time_t)(extra & EXT4_EPOCH_MASK) << 32);
+#endif
+	return seconds;
+}
+static inline __u32 __decode_extra_nsec(__u32 extra)
+{
+	return (extra & EXT4_NSEC_MASK) >> EXT4_EPOCH_BITS;
+}
+#define ext2fs_inode_actual_size(inode)					      \
+	((size_t)(EXT2_GOOD_OLD_INODE_SIZE +				      \
+		  (sizeof(*inode) > EXT2_GOOD_OLD_INODE_SIZE ?		      \
+		   ((struct ext2_inode_large *)(inode))->i_extra_isize : 0)))
+#define clamp(val, min, max) ((val) < (min) ? (min) : ((val) > (max) ?	      \
+						       (max) : (val)))
+#define ext2fs_inode_xtime_set(inode, field, sec)			      \
+do {									      \
+	if (ext2fs_inode_includes(ext2fs_inode_actual_size(inode),	      \
+				  field ## _extra)) {			      \
+		(inode)->field = (__u32)(sec & 0xfffffff);		      \
+		((struct ext2_inode_large *)(inode))->field ## _extra =       \
+			__encode_extra_time(sec, 0);			      \
+	} else {							      \
+		(inode)->field = (__u32) clamp(sec, INT32_MIN, INT32_MAX);    \
+	}								      \
+} while (0)
+#define ext2fs_inode_xtime_get(inode, field)				      \
+(ext2fs_inode_includes(ext2fs_inode_actual_size(inode), field ## _extra) ?    \
+	__decode_extra_sec((inode)->field,				      \
+		((struct ext2_inode_large *)(inode))->field ## _extra) :      \
+		(time_t)(inode)->field)
+
+static inline void __sb_set_tstamp(__u32 *lo, __u8 *hi EXT2FS_ATTR((unused)),
+				   time_t seconds)
+{
+	*lo = seconds & 0xffffffff;
+#if (SIZEOF_TIME_T > 4)
+	*hi = (seconds >> 32) & EXT4_EPOCH_MASK;
+#else
+	*hi = 0;
+#endif
+}
+static inline time_t __sb_get_tstamp(__u32 *lo, __u8 *hi EXT2FS_ATTR((unused)))
+{
+#if (SIZEOF_TIME_T == 4)
+	return *lo;
+#else
+	return ((time_t)(*hi) << 32) | *lo;
+#endif
+}
+#define ext2fs_set_tstamp(sb, field, seconds) \
+	__sb_set_tstamp(&(sb)->field, &(sb)->field ## _hi, seconds)
+#define ext2fs_get_tstamp(sb, field) \
+	__sb_get_tstamp(&(sb)->field, &(sb)->field ## _hi)
+
 /*
  * ext2_icount_t abstraction
  */
@@ -719,6 +795,21 @@ struct ext2_xattr_handle;
 #define EXT2FS_BITMAPS_VALID_FLAGS	0x0007
 
 /*
+ * flags for ext2fs_unlink()
+ */
+
+/* Forcefully unlink even if the inode number doesn't match the dirent */
+#define EXT2FS_UNLINK_FORCE		0x1
+
+/*
+ * flags for ext2fs_link()
+ *
+ */
+#define EXT2FS_LINK_FT_MASK	0x0007
+#define EXT2FS_LINK_APPEND	0x0010
+#define EXT2FS_LINK_EXPAND	0x0020
+
+/*
  * function prototypes
  */
 static inline int ext2fs_has_group_desc_csum(ext2_filsys fs)
@@ -795,6 +886,10 @@ errcode_t ext2fs_alloc_range(ext2_filsys fs, int flags, blk64_t goal,
 extern int ext2fs_reserve_super_and_bgd(ext2_filsys fs,
 					dgrp_t group,
 					ext2fs_block_bitmap bmap);
+extern errcode_t ext2fs_reserve_super_and_bgd2(ext2_filsys fs,
+					       dgrp_t group,
+					       ext2fs_block_bitmap bmap,
+					       blk_t *desc_blocks);
 extern void ext2fs_set_block_alloc_stats_callback(ext2_filsys fs,
 						  void (*func)(ext2_filsys fs,
 							       blk64_t blk,
@@ -1312,6 +1407,7 @@ errcode_t ext2fs_xattr_set(struct ext2_xattr_handle *handle,
 			   size_t value_len);
 errcode_t ext2fs_xattr_remove(struct ext2_xattr_handle *handle,
 			      const char *key);
+errcode_t ext2fs_xattr_remove_all(struct ext2_xattr_handle *handle);
 errcode_t ext2fs_xattrs_open(ext2_filsys fs, ext2_ino_t ino,
 			     struct ext2_xattr_handle **handle);
 errcode_t ext2fs_xattrs_close(struct ext2_xattr_handle **handle);
@@ -1483,6 +1579,13 @@ errcode_t ext2fs_convert_subcluster_bitmap(ext2_filsys fs,
 					   ext2fs_block_bitmap *bitmap);
 errcode_t ext2fs_count_used_clusters(ext2_filsys fs, blk64_t start,
 				     blk64_t end, blk64_t *out);
+errcode_t ext2fs_count_used_blocks(ext2_filsys fs, blk64_t start,
+				   blk64_t end, blk64_t *out);
+extern unsigned int ext2fs_list_backups(ext2_filsys fs, unsigned int *three,
+				unsigned int *five, unsigned int *seven);
+
+/* getenv.c */
+extern char *ext2fs_safe_getenv(const char *arg);
 
 /* get_num_dirs.c */
 extern errcode_t ext2fs_get_num_dirs(ext2_filsys fs, ext2_ino_t *ret_num_dirs);
@@ -1660,6 +1763,10 @@ extern int ext2fs_casefold_cmp(const struct ext2fs_nls_table *table,
 /* mkdir.c */
 extern errcode_t ext2fs_mkdir(ext2_filsys fs, ext2_ino_t parent, ext2_ino_t inum,
 			      const char *name);
+extern errcode_t ext2fs_mkdir2(ext2_filsys fs, ext2_ino_t parent,
+			       ext2_ino_t ino, unsigned long flags,
+			       int link_flags, const char *name,
+			       ext2_ino_t *ret_ino);
 
 /* mkjournal.c */
 struct ext2fs_journal_params {
@@ -1729,14 +1836,15 @@ extern errcode_t ext2fs_get_pathname(ext2_filsys fs, ext2_ino_t dir, ext2_ino_t 
 			       char **name);
 
 /* link.c */
-#define EXT2FS_UNLINK_FORCE		0x1	/* Forcefully unlink even if
-						 * the inode number doesn't
-						 * match the dirent
-						 */
 errcode_t ext2fs_link(ext2_filsys fs, ext2_ino_t dir, const char *name,
 		      ext2_ino_t ino, int flags);
 errcode_t ext2fs_unlink(ext2_filsys fs, ext2_ino_t dir, const char *name,
 			ext2_ino_t ino, int flags);
+int ext2fs_dir_is_dx(ext2_filsys fs, const struct ext2_inode *inode);
+void ext2fs_inc_nlink(ext2_filsys fs, struct ext2_inode *inode);
+void ext2fs_dec_nlink(struct ext2_inode *inode);
+int ext2fs_dir_link_max(ext2_filsys fs, struct ext2_inode_large *inode);
+int ext2fs_dir_link_empty(struct ext2_inode *inode);
 
 /* symlink.c */
 errcode_t ext2fs_symlink(ext2_filsys fs, ext2_ino_t parent, ext2_ino_t ino,
@@ -1753,6 +1861,7 @@ errcode_t ext2fs_mmp_update(ext2_filsys fs);
 errcode_t ext2fs_mmp_update2(ext2_filsys fs, int immediately);
 errcode_t ext2fs_mmp_stop(ext2_filsys fs);
 unsigned ext2fs_mmp_new_seq(void);
+errcode_t ext2fs_mmp_get_mem(ext2_filsys fs, void **ptr);
 
 /* read_bb.c */
 extern errcode_t ext2fs_read_bb_inode(ext2_filsys fs,
@@ -1869,6 +1978,10 @@ extern blk_t ext2fs_group_last_block(ext2_filsys fs, dgrp_t group);
 extern blk_t ext2fs_inode_data_blocks(ext2_filsys fs,
 				      struct ext2_inode *inode);
 extern int ext2fs_htree_intnode_maxrecs(ext2_filsys fs, int blocks);
+extern int ext2fs_log2_u32(__u32 arg);
+extern int ext2fs_log2_u64(__u64 arg);
+extern int ext2fs_log10_u32(__u32 arg);
+extern int ext2fs_log10_u64(__u64 arg);
 extern unsigned int ext2fs_div_ceil(unsigned int a, unsigned int b);
 extern __u64 ext2fs_div64_ceil(__u64 a, __u64 b);
 extern int ext2fs_dirent_name_len(const struct ext2_dir_entry *entry);
@@ -2140,6 +2253,66 @@ _INLINE_ int ext2fs_htree_intnode_maxrecs(ext2_filsys fs, int blocks)
 }
 
 /*
+ * log base 2, rounded down
+ */
+_INLINE_ int ext2fs_log2_u32(__u32 arg)
+{
+	int l = 0;
+
+	arg >>= 1;
+	while (arg) {
+		l++;
+		arg >>= 1;
+	}
+	return l;
+}
+
+/*
+ * log base 2, rounded down
+ */
+_INLINE_ int ext2fs_log2_u64(__u64 arg)
+{
+	int l = 0;
+
+	arg >>= 1;
+	while (arg) {
+		l++;
+		arg >>= 1;
+	}
+	return l;
+}
+
+/*
+ * log base 10, rounded down
+ */
+_INLINE_ int ext2fs_log10_u32(__u32 arg)
+{
+	int l = 0;
+
+	arg /= 10;
+	while (arg) {
+		l++;
+		arg /= 10;
+	}
+	return l;
+}
+
+/*
+ * log base 10, rounded down
+ */
+_INLINE_ int ext2fs_log10_u64(__u64 arg)
+{
+	int l = 0;
+
+	arg /= 10;
+	while (arg) {
+		l++;
+		arg /= 10;
+	}
+	return l;
+}
+
+/*
  * This is an efficient, overflow safe way of calculating ceil((1.0 * a) / b)
  */
 _INLINE_ unsigned int ext2fs_div_ceil(unsigned int a, unsigned int b)
@@ -2215,6 +2388,30 @@ static inline unsigned int ext2_dir_htree_level(ext2_filsys fs)
 		return EXT4_HTREE_LEVEL;
 
 	return EXT4_HTREE_LEVEL_COMPAT;
+}
+
+/*
+ * We explicitly decided not to reserve space for a 64-bit dtime,
+ * since it's never displayed or exposed to userspace.  The dtime
+ * field is used a linked list for the ophan list, and for forensic
+ * purposes when trying to determine when an inode was deleted.  So
+ * right after the 2038 epoch, a deleted inode might end up with a
+ * dtime which is zero or smaller than the number of inodes, which
+ * will result in e2fsck reporting a potential problems.  So when we
+ * set the dtime, make sure that the dtime won't be mistaken for an
+ * inode number.
+ */
+static inline void ext2fs_set_dtime(ext2_filsys fs, struct ext2_inode *inode)
+{
+	__u32	t;
+
+	if (fs->now || (fs->flags2 & EXT2_FLAG2_USE_FAKE_TIME))
+		t = fs->now & 0xFFFFFFFF;
+	else
+		t = time(NULL) & 0xFFFFFFFF;
+	if (t < fs->super->s_inodes_count)
+		t = fs->super->s_inodes_count;
+	inode->i_dtime = t;
 }
 
 #ifdef __cplusplus

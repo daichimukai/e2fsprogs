@@ -235,6 +235,7 @@ static void parse_escape(char *word)
 static void free_instance(struct fsck_instance *i)
 {
 	free(i->prog);
+	free(i->type);
 	free(i->device);
 	free(i->base_device);
 	free(i);
@@ -806,6 +807,7 @@ static void compile_fs_type(char *fs_type, struct fs_type_compile *cmp)
 			if ((negate && !cmp->negate) ||
 			    (!negate && cmp->negate)) {
 				fputs(_(fs_type_syntax_error), stderr);
+				free(list);
 				exit(EXIT_USAGE);
 			}
 		}

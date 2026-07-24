@@ -1,6 +1,6 @@
 AC_INIT
 AC_CONFIG_SRCDIR([version.h])
-AC_PREREQ([2.71])
+AC_PREREQ([2.72])
 AC_CONFIG_AUX_DIR(config)
 AC_CONFIG_HEADERS([lib/config.h])
 AH_BOTTOM([#include <dirpaths.h>])
@@ -365,10 +365,10 @@ CFLAGS_STLIB="${CFLAGS_STLIB:-$CFLAGS}"
 LDFLAGS_SHLIB=${LDFLAGS_SHLIB:-$LDFLAGS}
 LDFLAGS_STATIC=${LDFLAGS_STATIC:-$LDFLAGS}
 AC_ARG_ENABLE([hardening],
-AS_HELP_STRING([--enable-hardening],[build for coverage testing using gcov]),
+AS_HELP_STRING([--enable-hardening],[build with hardening flags such as fortify]),
 if test "$enableval" = "yes"
 then
-	HARDEN_CFLAGS="-D_FORTIFY_SOURCE=2 -fstack-protector-strong"
+	HARDEN_CFLAGS="-D_FORTIFY_SOURCE=3 -fstack-protector-strong"
 	HARDEN_LDFLAGS=["-Wl,-z,relro -Wl,-z,now"]
 	CFLAGS="$CFLAGS $HARDEN_CFLAGS -fPIE"
 	CFLAGS_SHLIB="$CFLAGS_SHLIB $HARDEN_CFLAGS"
@@ -943,7 +943,7 @@ dnl End of configuration options
 dnl
 AC_SUBST(BINARY_TYPE)
 AC_PROG_MAKE_SET
-CHECK_GNU_MAKE
+AX_CHECK_GNU_MAKE
 AC_PATH_PROG(LN, ln, ln)
 AC_PROG_MKDIR_P
 dnl
@@ -1009,6 +1009,7 @@ AC_CHECK_HEADERS(m4_flatten([
 	linux/falloc.h
 	linux/fd.h
 	linux/fsmap.h
+	linux/fsverity.h
 	linux/major.h
 	linux/loop.h
 	linux/types.h
@@ -1118,12 +1119,14 @@ AC_CHECK_DECL(fsmap_sizeof,[AC_DEFINE(HAVE_FSMAP_SIZEOF, 1,
 dnl
 dnl Word sizes...
 dnl
+AC_SYS_LARGEFILE
 AC_CHECK_SIZEOF(short)
 AC_CHECK_SIZEOF(int)
 AC_CHECK_SIZEOF(long)
 AC_CHECK_SIZEOF(long long)
 AC_CHECK_SIZEOF(off_t)
 AC_CHECK_SIZEOF(time_t)
+AC_CHECK_SIZEOF(void *)
 SIZEOF_SHORT=$ac_cv_sizeof_short
 SIZEOF_INT=$ac_cv_sizeof_int
 SIZEOF_LONG=$ac_cv_sizeof_long
@@ -1154,6 +1157,11 @@ if grep HAVE_SYS_TYPES_H confdefs.h > tmp_config.$$; then
   uniq tmp_config.$$ >> public_config.h
 else
   echo "#undef HAVE_SYS_TYPES_H" >> public_config.h
+fi
+if grep SIZEOF_TIME_T confdefs.h > tmp_config.$$; then
+  uniq tmp_config.$$ >> public_config.h
+else
+  echo "#undef SIZEOF_TIME_T" >> public_config.h
 fi
 if grep WORDS_BIGENDIAN confdefs.h > tmp_config.$$; then
   uniq tmp_config.$$ >> public_config.h
@@ -1238,6 +1246,7 @@ AC_CHECK_FUNCS(m4_flatten([
 	getrandom
 	getrlimit
 	getrusage
+	gettid
 	jrand48
 	keyctl
 	llistxattr
@@ -1261,6 +1270,8 @@ AC_CHECK_FUNCS(m4_flatten([
 	pwrite
 	pread64
 	pwrite64
+	pthread_setname_np
+	pthread_threadid_np
 	qsort_r
 	secure_getenv
 	setmntent
@@ -1298,12 +1309,68 @@ if test "$ac_cv_func_dlopen" = yes ; then
 fi
 AC_SUBST(MAGIC_LIB)
 dnl
+dnl libarchive
+dnl
+AC_ARG_WITH([libarchive],
+AS_HELP_STRING([--without-libarchive],[disable use of libarchive]),
+[if test "$withval" = "no"
+then
+	try_libarchive=""
+	AC_MSG_RESULT([Disabling libarchive support])
+	AC_DEFINE(CONFIG_DISABLE_LIBARCHIVE, 1,
+		[Define to 1 to completely disable libarchive])
+elif test "$withval" = "direct"
+then
+	try_libarchive="direct"
+	AC_MSG_RESULT([Testing for libarchive support (forced direct link)])
+else
+	try_libarchive="yes"
+	AC_MSG_RESULT([Testing for libarchive support (with dlopen)])
+fi]
+,
+[
+case "$host_os" in
+    darwin*)
+	try_libarchive="direct"
+	AC_MSG_RESULT([Try testing for libarchive support (with static linking) by default])
+	 ;;
+    *)
+        try_libarchive="yes"
+	AC_MSG_RESULT([Try testing for libarchive support (with dlopen) by default])
+	;;
+esac
+])
+ARCHIVE_LIBS=
+if test -n "$try_libarchive"
+then
+    PKG_CHECK_MODULES([ARCHIVE],[libarchive],
+    [
+	AC_MSG_RESULT([pkg-config found libarchive])
+	CFLAGS="$ARCHIVE_CFLAGS $CFLAGS"
+    ],[
+        AC_CHECK_LIB(archive, archive_read_new, [ARCHIVE_LIBS=-larchive])
+    ])
+    if test -n "$ARCHIVE_LIBS" ; then
+        AC_CHECK_HEADERS([archive.h])
+        if test "$ac_cv_func_dlopen" = yes -a "$try_libarchive" != "direct"; then
+            ARCHIVE_LIBS=$DLOPEN_LIB
+	    AC_DEFINE(CONFIG_DLOPEN_LIBARCHIVE, 1,
+		[Define to 1 if using dlopen to access libarchive])
+        fi
+    fi
+    if test "$ac_cv_header_archive_h" != "yes"
+    then
+        ARCHIVE_LIBS=
+    fi
+fi
+AC_SUBST(ARCHIVE_LIBS)
+dnl
 dnl Check to see if librt is required for clock_gettime() (glibc < 2.17)
 dnl
 AC_CHECK_LIB(rt, clock_gettime, [CLOCK_GETTIME_LIB=-lrt])
 AC_SUBST(CLOCK_GETTIME_LIB)
 dnl
-dnl Check to see if the FUSE library is -lfuse or -losxfuse
+dnl Check to see if the FUSE library is -lfuse3, -losxfuse, or -lfuse
 dnl
 FUSE_CMT=
 FUSE_LIB=
@@ -1315,27 +1382,35 @@ then
 	FUSE_CMT="#"
 	AC_MSG_RESULT([Disabling fuse2fs])
 else
-	AC_CHECK_HEADERS([pthread.h fuse.h], [],
-[AC_MSG_FAILURE([Cannot find fuse2fs headers.])],
-[#define _FILE_OFFSET_BITS	64
-#define FUSE_USE_VERSION 29])
-
 	AC_PREPROC_IFELSE(
-[AC_LANG_PROGRAM([[#define FUSE_USE_VERSION 29
-#ifdef __linux__
+[AC_LANG_PROGRAM([[#ifdef __linux__
 #include <linux/fs.h>
 #include <linux/falloc.h>
 #include <linux/xattr.h>
 #endif
 ]], [])], [], [AC_MSG_FAILURE([Cannot find fuse2fs Linux headers.])])
 
-	AC_CHECK_LIB(osxfuse, fuse_main, [FUSE_LIB=-losxfuse],
-		[AC_CHECK_LIB(fuse, fuse_main, [FUSE_LIB=-lfuse],
-			      [AC_MSG_FAILURE([Cannot find fuse library.])])])
+	PKG_CHECK_MODULES([fuse3], [fuse3],
+	  [
+		FUSE_LIB=-lfuse3
+	  ], [
+		AC_CHECK_HEADERS([pthread.h fuse.h], [],
+			[AC_MSG_FAILURE([Cannot find fuse2fs headers.])],
+[#define _FILE_OFFSET_BITS	64
+#define FUSE_USE_VERSION 29])
+
+		AC_CHECK_LIB(osxfuse, fuse_main, [FUSE_LIB=-losxfuse],
+			[AC_CHECK_LIB(fuse, fuse_main, [FUSE_LIB=-lfuse],
+				[AC_MSG_FAILURE([Cannot find fuse library.])])])
+	  ])
 	AC_MSG_RESULT([Enabling fuse2fs])
 fi
 ,
-AC_CHECK_HEADERS([pthread.h fuse.h], [], [FUSE_CMT="#"],
+PKG_CHECK_MODULES([fuse3], [fuse3],
+  [
+	FUSE_LIB=-lfuse3
+  ], [
+	AC_CHECK_HEADERS([pthread.h fuse.h], [], [FUSE_CMT="#"], 
 [#define _FILE_OFFSET_BITS	64
 #define FUSE_USE_VERSION 29
 #ifdef __linux__
@@ -1343,11 +1418,13 @@ AC_CHECK_HEADERS([pthread.h fuse.h], [], [FUSE_CMT="#"],
 # include <linux/falloc.h>
 # include <linux/xattr.h>
 #endif])
-if test -z "$FUSE_CMT"
-then
-	AC_CHECK_LIB(osxfuse, fuse_main, [FUSE_LIB=-losxfuse],
-[AC_CHECK_LIB(fuse, fuse_main, [FUSE_LIB=-lfuse], [FUSE_CMT="#"])])
-fi
+	if test -z "$FUSE_CMT"
+	then
+		AC_CHECK_LIB(osxfuse, fuse_main, [FUSE_LIB=-losxfuse],
+			[AC_CHECK_LIB(fuse, fuse_main, [FUSE_LIB=-lfuse],
+				[FUSE_CMT="#"])])
+	fi
+  ])
 if test -z "$FUSE_CMT"
 then
 	AC_MSG_RESULT([Enabling fuse2fs by default.])
@@ -1355,6 +1432,95 @@ fi
 )
 AC_SUBST(FUSE_LIB)
 AC_SUBST(FUSE_CMT)
+if test "$FUSE_LIB" = "-lfuse3"
+then
+	FUSE_USE_VERSION=35
+	CFLAGS="$fuse3_CFLAGS $CFLAGS"
+	FUSE_LIB="$fuse3_LIBS"
+	AC_CHECK_HEADERS([pthread.h fuse.h], [],
+		[AC_MSG_FAILURE([Cannot find fuse3 fuse2fs headers.])],
+[#define _FILE_OFFSET_BITS	64
+#define FUSE_USE_VERSION 35
+#ifdef __linux__
+#include <linux/fs.h>
+#include <linux/falloc.h>
+#include <linux/xattr.h>
+#endif])
+elif test -n "$FUSE_LIB"
+then
+	FUSE_USE_VERSION=29
+fi
+if test -n "$FUSE_USE_VERSION"
+then
+	AC_DEFINE_UNQUOTED(FUSE_USE_VERSION, $FUSE_USE_VERSION,
+		[Define to the version of FUSE to use])
+fi
+
+dnl
+dnl Check if the FUSE cache_readdir flag is supported
+dnl
+have_fuse_cache_readdir=
+if test -n "$FUSE_USE_VERSION"
+then
+	AC_MSG_CHECKING(for cache_readdir support in libfuse)
+	AC_LINK_IFELSE(
+	[	AC_LANG_PROGRAM([[
+	#define _GNU_SOURCE
+	#define _FILE_OFFSET_BITS	64
+	#define FUSE_USE_VERSION	314
+	#include <fuse.h>
+		]], [[
+	struct fuse_file_info fs_ops = {
+		.cache_readdir = 1,
+	};
+		]])
+	], have_fuse_cache_readdir=yes
+	   AC_MSG_RESULT(yes),
+	   AC_MSG_RESULT(no))
+fi
+if test -n "$have_fuse_cache_readdir"
+then
+	AC_DEFINE(HAVE_FUSE_CACHE_READDIR, 1,
+		  [Define to 1 if fuse supports cache_readdir])
+fi
+
+dnl
+dnl see if PR_SET_IO_FLUSHER exists
+dnl
+AC_MSG_CHECKING(for PR_SET_IO_FLUSHER)
+AC_LINK_IFELSE(
+[	AC_LANG_PROGRAM([[
+#define _GNU_SOURCE
+#include <sys/prctl.h>
+	]], [[
+prctl(PR_SET_IO_FLUSHER, 0, 0, 0, 0);
+	]])
+], have_pr_set_io_flusher=yes
+   AC_MSG_RESULT(yes),
+   AC_MSG_RESULT(no))
+if test "$have_pr_set_io_flusher" = yes; then
+  AC_DEFINE(HAVE_PR_SET_IO_FLUSHER, 1, [Define to 1 if PR_SET_IO_FLUSHER is present])
+fi
+
+dnl
+dnl see if CLOCK_MONOTONIC exists
+dnl
+AC_MSG_CHECKING(for CLOCK_MONOTONIC)
+AC_LINK_IFELSE(
+[	AC_LANG_PROGRAM([[
+#define _GNU_SOURCE
+#include <time.h>
+	]], [[
+struct timespec nuts;
+clock_gettime(CLOCK_MONOTONIC, &nuts);
+	]])
+], have_clock_monotonic=yes
+   AC_MSG_RESULT(yes),
+   AC_MSG_RESULT(no))
+if test "$have_clock_monotonic" = yes; then
+  AC_DEFINE(HAVE_CLOCK_MONOTONIC, 1, [Define to 1 if CLOCK_MONOTONIC is present])
+fi
+
 dnl
 dnl See if optreset exists
 dnl
@@ -1591,9 +1757,6 @@ if test "$enable_fuzzing" = "yes" || test "$enable_fuzzing" = "probe"; then
 	AC_SUBST(have_fuzzer)
 	AC_SUBST(fuzzer_cflags)
 	AC_SUBST(fuzzer_ldflags)
-fi
-if test "$enable_fuzzer" = "yes" && test "$have_fuzzer" != "yes"; then
-	AC_MSG_ERROR([Fuzzing not supported by compiler.])
 fi
 AC_SUBST(FUZZING_CMT)
 dnl
@@ -1903,7 +2066,23 @@ OS_IO_FILE=""
 esac]
 AC_SUBST(OS_IO_FILE)
 
-AC_SYS_LARGEFILE
+dnl Check for fsverity ioctl
+if test "${ac_cv_header_linux_fsverity_h}" = "yes"; then
+   AC_MSG_CHECKING([for FS_IOC_READ_VERITY_METADATA ioctl])
+   AC_PREPROC_IFELSE(
+   [AC_LANG_PROGRAM([[
+#include <linux/fsverity.h>
+#ifndef FS_IOC_READ_VERITY_METADATA
+# error "FS_IOC_READ_VERITY_METADATA not available"
+#endif
+]], [])], [
+   AC_DEFINE([HAVE_FS_IOC_READ_VERITY_METADATA], [1], [Define to 1 if FS_IOC_READ_VERITY_METADATA ioctl is available])
+   AC_MSG_RESULT([yes])
+   ],
+   [
+   AC_MSG_RESULT([no])
+   ])
+fi
 
 dnl
 dnl Make our output files, being sure that we create the some miscellaneous 
